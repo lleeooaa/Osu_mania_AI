@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 import supervised_main
 import threading
+import time
 
 root = tk.Tk()
 root.title("Osu!mania Training")
@@ -28,13 +29,14 @@ def play():
 
 def play_game():
     env = supervised_main.OsuManiaEnv()
-    state, key_states = env.reset()
+    state = env.reset()
     done = False
     counter=0
     while not done:
-        action = agent.select_action(state, key_states)
+        #time.sleep(0.003)
+        action = agent.select_action(state)
         env.perform_action(action)
-        state, key_states, _, done = env.step()
+        state, _, done = env.step()
         counter+=1
     print(counter)
 
