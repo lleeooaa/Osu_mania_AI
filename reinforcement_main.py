@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.optim as optim
 import gym
 from gym import spaces
-from collections import deque
 import itertools
 import time
 import easyocr
@@ -41,7 +40,7 @@ class OsuManiaNet(nn.Module):
         x = self.convs(x)
         x = x.view(x.size(0), -1)
         x = nn.functional.relu(self.fc1(x))
-        x = self.fc2(x)
+        x = nn.functional.softmax(self.fc2(x), dim=1)
         return x
     
 # Define reinforcement learning agent
@@ -50,38 +49,64 @@ class OsuManiaAgent:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = OsuManiaNet().to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        self.replay_buffer = deque(maxlen=3000)
+        self.replay_buffer = []
         self.action_map = list(itertools.product([0, 1], repeat=4))
+        self.epsilon = -0.5
 
     def select_action(self, state):
+        if np.random.rand() < self.epsilon:
+            action = [np.random.randint(2),np.random.randint(2),np.random.randint(2),np.random.randint(2)]  # Random action
+        else:
+            with torch.no_grad():
+                state = torch.FloatTensor(state).unsqueeze(0).to(self.device) 
+                action_probs = self.model(state)
+                action_index = torch.multinomial(action_probs, 1).item()
+                #action_index = torch.argmax(action_probs)
+            action = self.action_map[action_index]
+        return list(action)
+    
+    def output_action(self, state):
         with torch.no_grad():
             state = torch.FloatTensor(state).unsqueeze(0).to(self.device) 
-            action_probs = nn.functional.softmax(self.model(state), dim=1)
-            action_index = torch.multinomial(action_probs, 1).item()
+            action_probs = self.model(state)
+            print(action_probs)
+            action_index = torch.argmax(action_probs)
         action = self.action_map[action_index]
         return list(action)
 
     def update_model(self, low, up):
         if up>len(self.replay_buffer):
+            up=len(self.replay_buffer)
+        if low>=len(self.replay_buffer):
             return
-        batch=deque(itertools.islice(self.replay_buffer, low, up))
-        states, actions, losses = zip(*batch)
+        batch=self.replay_buffer[low:up]
+        states, actions, rewards = zip(*batch)
         states = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
         action_indices = torch.tensor([self.action_map.index(tuple(action)) for action in actions], dtype=torch.int64).to(self.device)
-        losses = torch.tensor(np.array(losses), dtype=torch.float32).unsqueeze(1).to(self.device)
-        # Compute Q-values for current states
-        probs = nn.functional.softmax(self.model(states), dim=1)
+        rewards = torch.tensor(np.array(rewards), dtype=torch.float32).to(self.device)
+        probs = self.model(states)
         gathered_probs = probs.gather(1, action_indices.unsqueeze(1)).squeeze(1)
 
-        # Compute the loss as the negative log probability of the actions taken, weighted by the losses
-        loss_val = (gathered_probs * losses + 1 - gathered_probs).mean()
+        def loss_func(probs, rewards):
+            loss_terms = []
+            for prob, reward in zip(probs, rewards):
+                if reward <0.5:
+                    loss_term = (torch.exp(prob)-1) * 3
+                else:
+                    loss_term = -torch.log(prob) * reward
 
+                loss_terms.append(loss_term)
+            return torch.mean(torch.stack(loss_terms))
+        
+        loss_val = loss_func(gathered_probs, rewards)
+        print(loss_val)
         self.optimizer.zero_grad()
         loss_val.backward()
         self.optimizer.step()
 
     def train(self, num_episodes, env):
         global counter
+        #self.epsilon-=0.1
         for episode in range(num_episodes):
             counter=0
             start=time.time()
@@ -92,6 +117,7 @@ class OsuManiaAgent:
             done = False
             while not done and training_running:
                 action = self.select_action(state)
+                #action = self.output_action(state)
                 state, done = env.step(action)
                 if done:
                     break
@@ -103,19 +129,24 @@ class OsuManiaAgent:
                 self.extract_data(env)
                 if counter/(end-start)>=27:
                     for i in range(6):
-                        self.update_model(i*500,(i+1)*500)
-                else:
-                    self.replay_buffer.clear()
-                self.save_model(f'Osu_ai/model/reinforcement_episode_{episode}.pth')
+                        self.update_model(i*512,(i+1)*512)
+                self.replay_buffer.clear()
+                self.save_model(f'Osu_ai/model/reinforcement_model_{episode}_{env.accuracy}.pth')
                 pyautogui.click(1627,814)
                 time.sleep(2)
 
     def extract_data(self, env):
-        for i in range(len(env.record)):
-            loss = env.calculate_loss(env.record[i][1], env.record[i][2], env.record[i][3])
-            if loss == None:
+        for i in range(1,len(env.record)):
+            reward = env.calculate_reward(env.record[i][1], env.record[i][2], env.record[i][3], env.record[i][4])
+            """
+            cv2.imshow('f',env.record[i-1][0].squeeze(0))
+            cv2.waitKey(0)
+            print(env.record[i][3])
+            print(reward)
+            """
+            if reward == None:
                 continue
-            self.replay_buffer.append((env.record[i][0], env.record[i][3], loss))
+            self.replay_buffer.append((env.record[i-1][0], env.record[i][4], reward))
 
     def save_model(self, path):
         torch.save({
@@ -135,11 +166,14 @@ class OsuManiaEnv(gym.Env):
     def __init__(self):
         self.observation_space = spaces.Box(low=0, high=1, shape=(140, 50, 1), dtype=np.float32)
         self.action_space = spaces.MultiDiscrete([2, 2, 2, 2]) 
+        self.accuracy = 0
         self.combo = 0
         self.keys = ['d', 'f', 'j', 'k']
         self.record=[]
+        self.fixed_accuracy= {0:0, 50:1.5, 100:2, 200:2.5, 300:6}
 
-    def reset(self):  
+    def reset(self):
+        self.accuracy = 100  
         self.combo=0
         self.record.clear()
         pyautogui.keyUp('d')
@@ -150,36 +184,27 @@ class OsuManiaEnv(gym.Env):
             rect=sct.monitors[0]
             img = np.array(sct.grab(rect))
             img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-        observation = self.preprocess_screen(img)
+        observation = self.preprocess_screen(img[825:925, 305:445],img[825:925, 620:755])
         return observation
 
     def step(self, action):
         global counter
         counter+=1
-        #start=time.time()
         self.perform_action(action)
-        #print("action time:",time.time()-start)
-        #start=time.time()
         with mss.mss() as sct:
             rect=sct.monitors[0]
             img = np.array(sct.grab(rect))
             img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-        #print("cap time:",time.time()-start)
-        #start=time.time()
-        observation = self.preprocess_screen(img[824:924, 300:580])
-        self.record.append([observation,img[280:400, 320:550], img[980:1050, 375:510], action])
-        #print("preprocess time:",time.time()-start)
-        #start=time.time()
-        #print("cal time:",time.time()-start)
-        #start=time.time()
+        next_state_observation = self.preprocess_screen(img[825:925, 305:445],img[825:925, 620:760])
+        self.record.append([next_state_observation,img[65:110, 1740:1865], img[965:1060, 440:622], img[390:490,430:630], action])
         done = self.is_episode_done(img[0:140, 1320:1920])
-        #print("done time:",time.time()-start)
 
-        return observation, done
+        return next_state_observation, done
 
-    def preprocess_screen(self, img):
+    def preprocess_screen(self, left_img, right_img):
+        img = cv2.hconcat([left_img, right_img])
         img = cv2.resize(img, (140, 50))
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) 
         img = img.astype(np.float32) / 255.0
         img = np.expand_dims(img, axis=0)
 
@@ -193,30 +218,37 @@ class OsuManiaEnv(gym.Env):
                 pyautogui.keyUp(self.keys[i])
 
 
-    def calculate_loss(self, img1, img2, action):
-        accuracy = self.detect_accuracy(img1)
+    def calculate_reward(self, img1, img2, img3, action):
+        new_accuracy = self.detect_accuracy(img1)
         new_combo = self.detect_combo(img2)
-        if accuracy==300:
-            loss=0
-        elif accuracy==200:
-            loss=2
-        elif accuracy==100:
-            loss=4
-        elif accuracy==50:
-            loss=6 
-        elif accuracy==0:
-            loss=8
-        elif (new_combo==self.combo and action==[0,0,0,0]) or (new_combo>self.combo):
-            loss=0
-        elif self.combo>new_combo:
-            loss=None
-        else:
-            loss=2
+        if new_accuracy==None or new_combo==None:
+            return None
+        reward=0
+        if new_combo > self.combo:
+            fixed_accuracy=self.detect_fixed_accuracy(img3)
+            if new_accuracy == self.accuracy:
+                reward=96
+                reward-=(action.count(1)-(new_combo-self.combo))*48
+            elif new_accuracy > self.accuracy:
+                if fixed_accuracy!=0:
+                    reward=fixed_accuracy
+                    reward-=(action.count(1)-(new_combo-self.combo))*1.5
+            else:
+                reward=fixed_accuracy
+                if reward==6:
+                    reward=0.5
+                
+        
+        elif new_combo == self.combo:
+            if new_accuracy == self.accuracy and action==[0,0,0,0] and self.accuracy!=0:
+                reward=0.5
+
         self.combo = new_combo
-        return loss
+        self.accuracy = new_accuracy
+        return reward
 
     def is_episode_done(self, img):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         template = cv2.imread('Osu_ai/game_over.png', 0) 
         res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
         threshold = 0.7  # Adjust this value as needed
@@ -228,27 +260,46 @@ class OsuManiaEnv(gym.Env):
 
     def detect_accuracy(self, img):
         # Use OCR to read accuracy
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        accuracy_text=reader.readtext(gray,detail=0,allowlist='01235miss!')
-        if accuracy_text=="miss!":
-            return 0
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        accuracy_text=reader.readtext(gray,detail=0,allowlist='0123456789.')
+        """
+        cv2.imshow("f",gray)
+        cv2.waitKey(0)
+        print(accuracy_text)
+        """
         try:
-            accuracy = int(accuracy_text[0])
+            accuracy = float(accuracy_text[0])
+            if accuracy>100 or accuracy<0:
+                accuracy=None
         except:
-            accuracy = None
-        if accuracy!=50 and accuracy!=100 and accuracy!=200 and accuracy!=300:
-            accuracy=None
+            accuracy = None 
         return accuracy
-    
+
     def detect_combo(self, img):
         # Use OCR to read accuracy
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        combo_text=reader.readtext(gray,detail=0,allowlist='0123456789')
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        combo_text=reader.readtext(gray,detail=0,allowlist='0123456789',mag_ratio=1.4)
         try:
             combo = int(combo_text[0])
+            if combo-self.combo>=5:
+                combo=self.combo-1
+            if combo<0:
+                combo = None
         except:
-            combo = self.combo  
+            combo = 0 
         return combo
+    
+    def detect_fixed_accuracy(self, img):
+        # Use OCR to read accuracy
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        fixed_accuracy_text=reader.readtext(gray,detail=0,allowlist='01235')
+        try:
+            fixed_accuracy = int(fixed_accuracy_text[0])
+            if fixed_accuracy not in self.fixed_accuracy.keys():
+                fixed_accuracy = 0
+        except:
+            fixed_accuracy = 0 
+        return self.fixed_accuracy[fixed_accuracy]
     
 
 def train_agent(agent, num_episodes):
@@ -256,4 +307,3 @@ def train_agent(agent, num_episodes):
     if agent==None:
         agent = OsuManiaAgent()
     agent.train(num_episodes, env)
-
